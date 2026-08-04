@@ -70,6 +70,65 @@ def _collapse_page(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return kept
 
 
+def _build_incomplete_plan(
+    rows_collected: list[dict[str, Any]],
+    uploaded_accounts: list[dict[str, Any]] | None,
+    reason: str,
+    brand_kit_id: str,
+    template_id: str,
+) -> dict[str, Any]:
+    """Build a plan with incomplete=False and a termination reason."""
+    # Dedupe the rows collected so far
+    seen_keys: dict[str, str] = {}
+    deduplicated_rows: list[dict[str, Any]] = []
+    identity_collisions: dict[str, list[str]] = {}
+
+    for row in rows_collected:
+        row_id = str(row["id"])
+        company_id = row.get("company_id")
+        if company_id:
+            dedup_key = str(company_id)
+        else:
+            dedup_key = row_id
+
+        if dedup_key in seen_keys:
+            winning_row_id = seen_keys[dedup_key]
+            if winning_row_id not in identity_collisions:
+                identity_collisions[winning_row_id] = []
+            identity_collisions[winning_row_id].append(row_id)
+        else:
+            seen_keys[dedup_key] = row_id
+            deduplicated_rows.append(row)
+
+    plan_result: dict[str, Any] = {
+        "source_row_ids": [str(row["id"]) for row in deduplicated_rows],
+        "deliverables": _make_deliverables(
+            deduplicated_rows,
+            brand_kit_id=brand_kit_id,
+            template_id=template_id,
+        ),
+        "identity_collisions": identity_collisions,
+        "complete": False,
+        "failure_reason": reason,
+    }
+
+    # Calculate expected vs actual if we have uploaded accounts
+    if uploaded_accounts is not None:
+        expected_keys: set[str] = set()
+        for account in uploaded_accounts:
+            company_id = account.get("company_id")
+            if company_id:
+                expected_keys.add(str(company_id))
+            else:
+                expected_keys.add(str(account["id"]))
+
+        actual_keys = set(seen_keys.keys())
+        plan_result["expected_companies"] = len(expected_keys)
+        plan_result["actual_companies"] = len(actual_keys)
+
+    return plan_result
+
+
 def _make_deliverables(
     accounts: list[dict[str, Any]],
     *,
@@ -104,14 +163,59 @@ def build_campaign_plan(
     brand_kit_id: str,
     template_id: str,
     page_size: int = 25,
+    uploaded_accounts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     all_rows: list[dict[str, Any]] = []
     cursor: str | None = None
+    seen_cursors: set[str | None] = set()
+    row_ids_seen: set[str] = set()
+
     while True:
         page = tool.load_page(cursor=cursor, page_size=page_size)
+
+        # Check for truncated without cursor: claims more data but provides no way to get it
+        if page.truncated and page.next_cursor is None:
+            return _build_incomplete_plan(
+                all_rows,
+                uploaded_accounts,
+                reason="truncated_without_cursor",
+                brand_kit_id=brand_kit_id,
+                template_id=template_id,
+            )
+
+        # Check for stalled cursor: no rows but claims more remain
+        if len(page.rows) == 0 and page.truncated:
+            return _build_incomplete_plan(
+                all_rows,
+                uploaded_accounts,
+                reason="stalled_cursor",
+                brand_kit_id=brand_kit_id,
+                template_id=template_id,
+            )
+
+        # Accumulate rows and track which ones are new
+        new_row_count = 0
+        for row in page.rows:
+            row_id = str(row["id"])
+            if row_id not in row_ids_seen:
+                new_row_count += 1
+                row_ids_seen.add(row_id)
         all_rows.extend(page.rows)
+
+        # Check for cycling cursor: if next_cursor was already returned before AND no new
+        # rows, we are in a true cycle (not just a repeated token that advances)
+        if page.truncated and page.next_cursor in seen_cursors and new_row_count == 0:
+            return _build_incomplete_plan(
+                all_rows,
+                uploaded_accounts,
+                reason="cycling_cursor",
+                brand_kit_id=brand_kit_id,
+                template_id=template_id,
+            )
+
         if not page.truncated:
             break
+        seen_cursors.add(page.next_cursor)
         cursor = page.next_cursor
 
     # Dedupe across full result set keyed on company_id (or row id if company_id is null/empty)
@@ -140,35 +244,108 @@ def build_campaign_plan(
             seen_keys[dedup_key] = row_id
             deduplicated_rows.append(row)
 
-    return {
+    # Determine completeness by comparing against uploaded accounts
+    plan_result: dict[str, Any] = {
         "source_row_ids": [str(row["id"]) for row in deduplicated_rows],
         "deliverables": _make_deliverables(
             deduplicated_rows,
             brand_kit_id=brand_kit_id,
             template_id=template_id,
         ),
-        "complete": True,
         "identity_collisions": identity_collisions,
     }
+
+    if uploaded_accounts is not None:
+        # Resolve uploaded accounts under identity rule
+        expected_keys: set[str] = set()
+        for account in uploaded_accounts:
+            company_id = account.get("company_id")
+            if company_id:
+                expected_keys.add(str(company_id))
+            else:
+                expected_keys.add(str(account["id"]))
+
+        # Count what we actually got
+        actual_keys = set(seen_keys.keys())
+
+        if actual_keys == expected_keys:
+            plan_result["complete"] = True
+        else:
+            # Short read: terminated cleanly but covered fewer companies than uploaded
+            plan_result["complete"] = False
+            plan_result["failure_reason"] = "short_read"
+            plan_result["expected_companies"] = len(expected_keys)
+            plan_result["actual_companies"] = len(actual_keys)
+    else:
+        # Without uploaded_accounts reference, assume complete
+        plan_result["complete"] = True
+
+    return plan_result
 
 
 def evaluate_campaign_coverage(
     plan: dict[str, Any],
     accounts: list[dict[str, Any]],
 ) -> tuple[bool, str]:
-    """The currently deployed check. The customer disputes its result."""
-    observed_rows = {str(value) for value in plan.get("source_row_ids", [])}
+    """Evaluate campaign coverage by iterating uploaded accounts, not surviving rows.
+
+    This catches missing companies that the plan failed to deliver.
+    """
     deliverables = plan.get("deliverables", [])
 
-    for row_id in sorted(observed_rows):
-        observed_types = {
-            str(item.get("asset_type"))
-            for item in deliverables
-            if str(item.get("source_row_id")) == row_id
-        }
+    # Resolve uploaded accounts under identity rule to get expected companies
+    expected_companies: dict[str, str] = {}  # dedup_key -> representative row_id
+    for account in accounts:
+        row_id = str(account["id"])
+        company_id = account.get("company_id")
+        # Dedup key: company_id if present, else row id
+        if company_id:
+            dedup_key = str(company_id)
+        else:
+            dedup_key = row_id
+
+        # Keep first occurrence for each key
+        if dedup_key not in expected_companies:
+            expected_companies[dedup_key] = row_id
+
+    # Check each expected company has complete asset set in deliverables
+    missing_companies = []
+    for dedup_key, expected_row_id in expected_companies.items():
+        # Find deliverables for any row that maps to this company identity
+        # We need to find which rows in the plan represent this company
+        observed_row_ids: set[str] = set()
+        for deliverable in deliverables:
+            deliverable_row_id = str(deliverable.get("source_row_id", ""))
+            # Check if this row belongs to the expected company
+            for account in accounts:
+                if str(account["id"]) == deliverable_row_id:
+                    account_company_id = account.get("company_id")
+                    if account_company_id:
+                        row_dedup_key = str(account_company_id)
+                    else:
+                        row_dedup_key = str(account["id"])
+
+                    if row_dedup_key == dedup_key:
+                        observed_row_ids.add(deliverable_row_id)
+                    break
+
+        if not observed_row_ids:
+            missing_companies.append(dedup_key)
+            continue
+
+        # Check asset types for this company
+        observed_types: set[str] = set()
+        for deliverable in deliverables:
+            if str(deliverable.get("source_row_id")) in observed_row_ids:
+                observed_types.add(str(deliverable.get("asset_type")))
+
         if observed_types != set(REQUIRED_ASSET_TYPES):
-            return False, f"source row {row_id} has the wrong asset set"
+            return False, f"company {dedup_key} has incomplete asset set: {observed_types}"
+
+    if missing_companies:
+        return False, f"missing companies: {missing_companies}"
 
     if plan.get("complete") is not True:
         return False, "campaign did not declare completion"
-    return True, f"all {len(observed_rows)} campaigned rows have the requested asset types"
+
+    return True, f"all {len(expected_companies)} expected companies have complete asset sets"

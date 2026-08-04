@@ -19,6 +19,7 @@ def _run(accounts: list[dict], request: dict, page_size: int) -> dict:
         brand_kit_id=request["brand_kit"]["id"],
         template_id=request["template"]["id"],
         page_size=page_size,
+        uploaded_accounts=accounts,
     )
     deliverables = plan["deliverables"]
     kits: dict[str, int] = {}
@@ -71,6 +72,7 @@ def main() -> None:
         TargetAccountTool(accounts),
         brand_kit_id=request["brand_kit"]["id"],
         template_id=request["template"]["id"],
+        uploaded_accounts=accounts,
     )
     passed, detail = evaluate_campaign_coverage(plan, accounts)
     print()

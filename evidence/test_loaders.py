@@ -85,6 +85,7 @@ def test_loader(loader_class, accounts: list[dict], request: dict) -> dict:
         loader,
         brand_kit_id="brand-kit-test",
         template_id="template-test",
+        uploaded_accounts=accounts,
     )
 
     print(f"Execution: {message}")

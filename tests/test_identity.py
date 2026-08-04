@@ -40,6 +40,7 @@ class IdentityTest(unittest.TestCase):
             brand_kit_id="brand-kit-meridian-2026",
             template_id="template-abm-q3",
             page_size=10,
+            uploaded_accounts=self.accounts,
         )
 
         # Assert exactly 209 rows in source_row_ids (one per logical company)
