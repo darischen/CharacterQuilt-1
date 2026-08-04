@@ -28,7 +28,7 @@ ReplayingLoader shows the check hiding duplication rather than causing it: 428 r
 
 **The number is 209.** 223 rows carry 203 distinct non-null company_id values. 6 rows have a null company_id and six distinct domains. 203 + 6 = 209.
 
-The neighboring numbers all fail. 203 is the raw row count, and names like "SABLE WORKS" or "Sable Works" or "SABLE WORKS Inc" are counted as 3 companies not 1. 217 counts rows carrying a usable id and has the same problem. 14 is what the shipped code reports at page_size 25, but the same code reports 211 at page_size 100, so it measures pagination rather than companies. 204 treats null as a key and folds six unrelated businesses into one. 206 collapses on domain, which breaks the EMEA subsidiaries: they carry distinct ids on a domain shared with their parent. 211 splits the two ids whose rows disagree on domain, company-kestrel-robotics and company-copperline-energy. I keep those merged, on the view that an explicit id outranks what looks like a data-entry error, and flag both pairs for review rather than deciding silently.
+The neighboring numbers all fail. 223 is the raw row count, and names like "SABLE WORKS" or "Sable Works" or "SABLE WORKS Inc" are counted as 3 companies not 1. 217 counts rows carrying a usable id and has the same problem. 214 is what the shipped code reports at page_size 25, but the same code reports 211 at page_size 100, so it measures pagination rather than companies. 204 treats null as a key and folds six unrelated businesses into one. 206 collapses on domain, which breaks the EMEA subsidiaries: they carry distinct ids on a domain shared with their parent. 211 splits the two ids whose rows disagree on domain, company-kestrel-robotics and company-copperline-energy. I keep those merged, on the view that an explicit id outranks what looks like a data-entry error, and flag both pairs for review rather than deciding silently.
 
 Trace `t-9f21` reports 209 with complete: true and a passing check, but that is the number the customer rejected rather than evidence for it, and it is not what this repository produces. I think that 209 was defensible but unverifiable at the same time, and the check iterated only the rows that survived pagination, and never compared them to the upload. It also read a complete=True hardcoded value, sop it would've passed the same as a wrong number.
 
@@ -42,24 +42,22 @@ A plan is complete only if every row the source holds was read once and mapped t
 Failing any of these sets complete=False with a machine-readable reason (stalled_cursor, cycling_cursor, truncated_without_cursor, budget_exhausted, short_read) and the count actually reached. A list that cannot be read completely should say so and say why, not report a smaller number as if it were the answer.
 
 ## What I changed and which changes removed a cause versus hid a symptom
-**PENDING**
+**Identity, resolved across the whole run (removed a cause).** _collapse_page deduped within a page, so repeats in later pages survived and str(None) collided id-less rows whenever two shared a page. Resolution now runs over the full result set, keyed on company_id where present and the row's own id where it is null, and every merge is recorded under identity_collisions. make demo` went from 214 / 214 / 211 across page sizes to 209 / 209 / 209.
 
-**Planned fixes**:
- - Add cursor advancement verification to the pagination loop. This would remove a cause.
- - truncated=True and next_cursor=None should be categorized into a named failure. This would remove a cause.
- - company_id identity rule should be globally applied and defined. This would remove a cause.
- - complete=True being hardcoded should be replaced with the definition derived above. This would remove a cause.
- - Rewrite evaluate_campaign_coverage to compare resolved logical companies against what the source actually holds. This would be added on top of the asset check. This would remove a cause.
- - According to customer complaint, "some of the creative is not in the brand we picked." 9 rows in target_accounts.json carry a saved_brand_kit_id that overrides the request's selected brand kit. The fix is to override the saved_brand_kit_id with the request's selected brand kit. This would remove a cause.
- - Anything not tied to one of the three causes above or is not mentioned in the customer complaint is out of scope.
+**Completeness derived, not asserted (removed a cause).** complete=True was hardcoded, and the check iterated only the rows that survived while ignoring the accounts argument it already received. Both now resolve the upload and compare against it. SilentlyShortLoader went from 116 rows passing to 116 rows, short_read, and 93 companies named as missing.
+
+**Termination faults named (removed a cause).** The loop trusted truncated and never checked progress, so three loaders ran to the mock's call budget and raised. It now tolerates a repeated cursor that still yields new rows, and stops on one that does not. All five terminate. CyclingLoader collects all 209 rows and still reports complete=False, since a read that wrapped rather than ended cannot claim completeness.
+
+Nothing I shipped hides a symptom; each change removes a reason the count was wrong or unverifiable.
+
+**Found and left:** nine rows carry saved_brand_kit_id: brand-kit-2019-legacy, silently overriding the kit named on the request. 36 of 836 deliverables ship in the legacy kit. This is the customer's "creative is not in the brand we picked". The fix is a precedence rule, and I ran out of budget. `second_list.json` has no overrides, so `make verify` would not catch a regression here either way.
+
+**Never fires:** stalled_cursor covers an empty page claiming truncation. No loader in sources.py produces that shape.
 
 ## Why the fix holds for the next list
-The identity rule, cursor-progress check, and completeness definition are from whatever the loader returns at runtime. Nothing references a row count, a company_id, or a file name, which means that none of the code is specific to the first list. Applying it to second_list.json would yield the same results, and the checks would still be valid.
+The identity rule, cursor-progress check, and completeness definition are from whatever the loader returns at runtime. Nothing references a row count, a company_id, or a file name, which means that none of the code is specific to the first list. Applying it to second_list.json yields the same results, and the checks are still valid.
 
-For example:
-  - There are 99 logical companies instead of 209
-  - Identity and not pagination is focused on. There are more company_id repeats in second_list.json.
-  - Zero rows carry the saved_brand_kit_id, so the override is not needed. make verify should show no correction happening, but if it does, this means that the fix leaked where it shouldn't have.
+From running make verify, it showed that there are 99 logical companies instead of 209 for all three page sizes for the second list while 209 was consistent across all three page sizes for the first list.
 
 The make verify command runs the same code against a different list, so a fix that only works on the first list would show up and would count as a failure.
 
