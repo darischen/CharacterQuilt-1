@@ -105,23 +105,50 @@ def build_campaign_plan(
     template_id: str,
     page_size: int = 25,
 ) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
+    all_rows: list[dict[str, Any]] = []
     cursor: str | None = None
     while True:
         page = tool.load_page(cursor=cursor, page_size=page_size)
-        rows.extend(_collapse_page(page.rows))
+        all_rows.extend(page.rows)
         if not page.truncated:
             break
         cursor = page.next_cursor
 
+    # Dedupe across full result set keyed on company_id (or row id if company_id is null/empty)
+    seen_keys: dict[str, str] = {}  # key -> winning row id
+    deduplicated_rows: list[dict[str, Any]] = []
+    identity_collisions: dict[str, list[str]] = {}  # winning row id -> list of absorbed row ids
+
+    for row in all_rows:
+        row_id = str(row["id"])
+        company_id = row.get("company_id")
+
+        # Determine the dedup key: company_id if present and non-empty, otherwise row id
+        if company_id:
+            dedup_key = str(company_id)
+        else:
+            dedup_key = row_id
+
+        if dedup_key in seen_keys:
+            # Collision: this row is a duplicate of an earlier one
+            winning_row_id = seen_keys[dedup_key]
+            if winning_row_id not in identity_collisions:
+                identity_collisions[winning_row_id] = []
+            identity_collisions[winning_row_id].append(row_id)
+        else:
+            # First occurrence of this key
+            seen_keys[dedup_key] = row_id
+            deduplicated_rows.append(row)
+
     return {
-        "source_row_ids": [str(row["id"]) for row in rows],
+        "source_row_ids": [str(row["id"]) for row in deduplicated_rows],
         "deliverables": _make_deliverables(
-            rows,
+            deduplicated_rows,
             brand_kit_id=brand_kit_id,
             template_id=template_id,
         ),
         "complete": True,
+        "identity_collisions": identity_collisions,
     }
 
 
